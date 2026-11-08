@@ -123,7 +123,7 @@ app.get('/manifest.json', (req, res) => {
   res.json({
     id: 'com.seonghun.nas.bitchord',
     name: '개인 NAS 및 KBS 클래식FM',
-    version: '1.0.5',
+    version: '1.0.6',
     resources: ['search', 'stream'],
     types: ['track'],
     contentType: 'music'
@@ -228,40 +228,53 @@ app.get('/stream/:id', (req, res) => {
   });
 });
 
-// 5. 📻 실시간 HLS -> 무한 AAC 스트림 중계 (BitChord 18초 끊김 방지)
+// 5. 📻 실시간 HLS -> 무한 AAC 스트림 중계 (버퍼 고갈 방지 v1.0.6)
 app.get('/radio/kbs-1fm', async (req, res) => {
+  if (req.socket) {
+    req.socket.setKeepAlive(true, 5000);
+    req.socket.setNoDelay(true);
+  }
+
   res.writeHead(200, {
     'Content-Type': 'audio/aac',
-    'Cache-Control': 'no-cache, no-store',
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0',
     'Connection': 'keep-alive',
     'Accept-Ranges': 'none'
   });
 
   let isAlive = true;
-  req.on('close', () => {
-    isAlive = false;
-  });
+  req.on('close', () => { isAlive = false; });
+  req.on('error', () => { isAlive = false; });
 
   const sentSegments = new Set();
-  let firstRun = true;
+  let playlistUrl = await getKbsClassicFmStream();
 
   while (isAlive) {
     try {
-      const playlistUrl = await getKbsClassicFmStream();
-      if (!playlistUrl) break;
+      if (!playlistUrl) {
+        playlistUrl = await getKbsClassicFmStream();
+        if (!playlistUrl) {
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+      }
 
       const m3u8Resp = await fetch(playlistUrl);
+      if (!m3u8Resp.ok) {
+        playlistUrl = null;
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+
       const m3u8Text = await m3u8Resp.text();
       const lines = m3u8Text.split('\n');
 
       const baseUrl = playlistUrl.substring(0, playlistUrl.lastIndexOf('/') + 1);
       const segments = lines.filter(l => l.trim().includes('.aac')).map(l => l.trim());
 
-      // 첫 연결 시 최근 2개 세그먼트를 즉시 보내 재생 시작
-      const candidates = firstRun ? segments.slice(-2) : segments;
-      firstRun = false;
-
-      for (const seg of candidates) {
+      for (const seg of segments) {
         if (!isAlive) break;
         if (sentSegments.has(seg)) continue;
 
@@ -272,28 +285,35 @@ app.get('/radio/kbs-1fm', async (req, res) => {
         }
 
         const segUrl = seg.startsWith('http') ? seg : `${baseUrl}${seg}`;
-        const segResp = await fetch(segUrl);
-        const arrayBuf = await segResp.arrayBuffer();
-        const buf = Buffer.from(arrayBuf);
+        try {
+          const segResp = await fetch(segUrl);
+          if (!segResp.ok) continue;
 
-        // ID3 태그 헤더 제거 후 순수 ADTS AAC 프레임 스트리밍
-        let audioBuf = buf;
-        if (buf.length > 10 && buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) {
-          const id3Size = ((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14) | ((buf[8] & 0x7f) << 7) | (buf[9] & 0x7f);
-          const offset = 10 + id3Size;
-          if (offset < buf.length) {
-            audioBuf = buf.subarray(offset);
+          const arrayBuf = await segResp.arrayBuffer();
+          const buf = Buffer.from(arrayBuf);
+
+          // ID3 태그 헤더 제거 후 순수 ADTS AAC 프레임 스트리밍
+          let audioBuf = buf;
+          if (buf.length > 10 && buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) {
+            const id3Size = ((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14) | ((buf[8] & 0x7f) << 7) | (buf[9] & 0x7f);
+            const offset = 10 + id3Size;
+            if (offset < buf.length) {
+              audioBuf = buf.subarray(offset);
+            }
           }
-        }
 
-        res.write(audioBuf);
+          res.write(audioBuf);
+        } catch (fetchErr) {
+          console.error('Segment fetch error:', fetchErr.message);
+        }
       }
     } catch (err) {
-      console.error('Radio relay error:', err.message);
+      console.error('Radio relay loop error:', err.message);
     }
 
     if (!isAlive) break;
-    await new Promise(r => setTimeout(r, 3500));
+    // 1.8초 주기로 감시하여 새 세그먼트 생성 즉시 밀어넣음 (버퍼 고갈 방지)
+    await new Promise(r => setTimeout(r, 1800));
   }
 
   res.end();
@@ -349,8 +369,8 @@ app.get('/audio/:id', async (req, res) => {
 app.get('/debug', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.0.5',
-    radio_channel: 'KBS 1FM Classic (Continuous AAC)',
+    version: '1.0.6',
+    radio_channel: 'KBS 1FM Classic (Continuous AAC v1.0.6)',
     total_tracks: trackIndex.length,
     sample_tracks: trackIndex.slice(0, 5),
     logs: scanLogs
